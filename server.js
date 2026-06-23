@@ -1,7 +1,7 @@
 import express from 'express';
 import multer from 'multer';
 import pdfParse from 'pdf-parse';
-import Groq from 'groq-sdk'; // <-- Replaced Google with Groq
+import Groq from 'groq-sdk'; 
 import cors from 'cors';
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
@@ -89,16 +89,34 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
         ${batchText}
       `;
       
-      // Call Groq API with Llama 3.3 70B
+      // Call Groq API with System Prompt configuration to prevent conversational chatter
       const chatCompletion = await groq.chat.completions.create({
-        messages: [{ role: "user", content: prompt }],
+        messages: [
+          { 
+            role: "system", 
+            content: "You are a data pipeline. You must output ONLY a valid JSON array. Never include any conversational text, greetings, or explanations before or after the JSON." 
+          },
+          { 
+            role: "user", 
+            content: prompt 
+          }
+        ],
         model: "llama-3.3-70b-versatile",
-        temperature: 0.1, // Low temperature for strict JSON accuracy
+        temperature: 0.1, 
       });
       
       let responseText = chatCompletion.choices[0]?.message?.content || "[]";
       
-      // Cleanup Output
+      // --- REGEX BOUNDARY FILTER ---
+      // Captures everything starting from the first '[' to the final ']', isolating the valid JSON array
+      const jsonMatch = responseText.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        responseText = jsonMatch[0];
+      } else {
+        responseText = "[]"; 
+      }
+      
+      // Cleanup whitespace, control characters, and backslashes
       responseText = responseText.replace(/```json/gi, '').replace(/```/gi, '').trim();
       responseText = responseText.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
       responseText = responseText.replace(/[\u0000-\u001F]+/g, "");
