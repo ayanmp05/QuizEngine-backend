@@ -45,14 +45,26 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
 
     const pdfData = await pdfParse(req.file.buffer);
-    const fullText = pdfData.text;
+    let fullText = pdfData.text;
+
+    // --- NEW FIX 1: Cut off the document before the Answer Key begins ---
+    // This instantly deletes the "Explanations" at the bottom of the PDF
+    fullText = fullText.split(/CORRECT ANSWERS:|Explanations:/i)[0];
 
     // 1. LOGICAL SPLIT
     const questionMatches = fullText.split(/(?=\n\s*\d+\.\s)/);
-    const questions = questionMatches.filter(q => q.trim().length > 50);
+    
+    // --- NEW FIX 2: Filter out Hindi and Noise ---
+    const questions = questionMatches.filter(q => {
+      const isLongEnough = q.trim().length > 50;
+      // This Regex detects Devanagari (Hindi) characters. If true, we throw the chunk away.
+      const hasHindiCharacters = /[\u0900-\u097F]/.test(q); 
+      
+      return isLongEnough && !hasHindiCharacters;
+    });
 
-    // 2. BATCHING: Group into batches of 20
-    const BATCH_SIZE = 20;
+    // 2. BATCHING: Group into batches of 10 to protect Token Limits
+    const BATCH_SIZE = 10;
     const batches = [];
     for (let i = 0; i < questions.length; i += BATCH_SIZE) {
       batches.push(questions.slice(i, i + BATCH_SIZE).join('\n'));
@@ -129,8 +141,8 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
     for (const batch of batches) {
       const batchResult = await processBatch(batch);
       finalQuestions.push(...batchResult);
-      // Wait 12 seconds between batches to avoid token rate limits
-      await delay(12000); 
+      // Wait 15 seconds between batches to ensure we stay under the 12,000 TPM limit
+      await delay(15000); 
     }
 
     // Save the new Quiz to MongoDB
