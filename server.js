@@ -15,8 +15,6 @@ import verifyToken from './middleware/verifyToken.js';
 dotenv.config();
 
 const app = express();
-
-// Enable CORS for all origins (Required for Vercel frontend to talk to Render backend)
 app.use(cors());
 app.use(express.json());
 
@@ -25,9 +23,7 @@ mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB Database'))
   .catch((err) => console.error('❌ MongoDB connection error:', err));
 
-// ==========================================
-// HEALTH CHECK ROUTE (CRITICAL FOR RENDER)
-// ==========================================
+// HEALTH CHECK ROUTE
 app.get('/', (req, res) => {
   res.status(200).send('QuizEngine API is up and running smoothly! 🚀');
 });
@@ -44,104 +40,90 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
 
     const pdfData = await pdfParse(req.file.buffer);
-    const rawText = pdfData.text.substring(0, 15000);
+    const fullText = pdfData.text;
 
-    const model = genAI.getGenerativeModel({ 
-      model: "gemini-2.5-flash", 
-      generationConfig: { responseMimeType: "application/json" }
-    });
+    // 1. LOGICAL SPLIT: Split by pattern (e.g., "1. ", "2. ")
+    const questionMatches = fullText.split(/(?=\n\s*\d+\.\s)/);
+    const questions = questionMatches.filter(q => q.trim().length > 50);
 
-    const prompt = `
-      You are an expert exam processor. Extract multiple-choice questions, options, and correct answers from the following banking exam study text.
+    // 2. BATCHING: Group into batches of 20
+    const BATCH_SIZE = 20;
+    const batches = [];
+    for (let i = 0; i < questions.length; i += BATCH_SIZE) {
+      batches.push(questions.slice(i, i + BATCH_SIZE).join('\n'));
+    }
+
+    // 3. PARALLEL PROCESSING FUNCTION
+    const processBatch = async (batchText) => {
+      const model = genAI.getGenerativeModel({ 
+        model: "gemini-2.5-flash", 
+        generationConfig: { responseMimeType: "application/json" }
+      });
+
+      const prompt = `
+        You are an expert exam processor. Extract structured JSON questions from these text segments.
+        Follow these strict rules:
+        - Output a valid JSON array of objects.
+        - Fields: id, question, options (array of 4 strings), answer.
+        - CAPTURE DIRECTION BLOCKS: Look for instruction blocks that apply to multiple questions and prepend them to the question text.
+        - IGNORE promotional headers, footers, and answer explanations.
+        
+        Text Data:
+        ${batchText}
+      `;
       
-      CRITICAL INSTRUCTIONS:
-      1. CAPTURE DIRECTION BLOCKS: Look for instruction blocks that apply to multiple questions (e.g., "Directions: The questions are based upon the following series..."). You MUST prepend this exact instruction/series string to the front of the "question" field for EVERY single question it applies to.
-      2. EXTRACT OPTIONS: You MUST locate and extract the multiple-choice options (usually labeled A, B, C, D, E) from the text immediately following the question. Do NOT just read the answer key at the end of the document. The "options" array MUST contain at least 4 strings. NEVER leave the options array empty.
-      3. IGNORE promotional header/footer noise, website URLs ("smartkeeda.com"), and page numbers.
-      4. IGNORE detailed answer explanation text blocks at the end of the document.
-      5. Output a strict JSON array of objects following this exact schema:
-      [
-        {
-          "id": 1,
-          "question": "The combined directions/series text AND the specific question text string",
-          "options": ["Option A text", "Option B text", "Option C text", "Option D text"],
-          "answer": "The exact correct option string matching one of the items in the options array"
-        }
-      ]
+      const result = await model.generateContent(prompt);
+      let responseText = result.response.text();
       
-      Unstructured text data:
-      ${rawText}
-    `;
+      // Cleanup AI Output
+      responseText = responseText.replace(/```json/gi, '').replace(/```/gi, '').trim();
+      responseText = responseText.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
+      responseText = responseText.replace(/[\u0000-\u001F]+/g, "");
+      
+      return JSON.parse(responseText);
+    };
 
-    const result = await model.generateContent(prompt);
-    let responseText = result.response.text();
-    
-    console.log("\n=== AI RAW OUTPUT START ===");
-    console.log(responseText);
-    console.log("=== AI RAW OUTPUT END ===\n");
+    // Process all batches concurrently
+    const results = await Promise.all(batches.map(batch => processBatch(batch)));
+    const finalQuestions = results.flat(); // Merge all batch arrays into one
 
-    // 1. Strip out markdown code blocks
-    responseText = responseText.replace(/```json/gi, '').replace(/```/gi, '').trim();
-
-    // 2. SANITIZER: Escape stray backslashes (like \$) that break JSON parsing
-    responseText = responseText.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
-
-    // 3. SANITIZER: Remove invisible control characters that can corrupt the string
-    responseText = responseText.replace(/[\u0000-\u001F]+/g, "");
-    
-    const questionsArray = JSON.parse(responseText);
-
-    // Save the new Quiz to MongoDB linked to the logged-in User
+    // Save the new Quiz to MongoDB
     const newQuiz = new Quiz({
       title: req.file.originalname,
       userId: req.user._id,
-      questions: questionsArray
+      questions: finalQuestions
     });
     await newQuiz.save();
 
-    res.json({ quizId: newQuiz._id, title: newQuiz.title, questions: questionsArray });
+    res.json({ quizId: newQuiz._id, title: newQuiz.title, questions: finalQuestions });
 
   } catch (error) {
     console.error('Processing Error:', error);
-    res.status(500).json({ error: error.message || 'Server failed to process document.' });
+    res.status(500).json({ error: 'Failed to process document. It might be too large or complex.' });
   }
 });
 
-// PROTECTED ROUTE: Save Quiz Attempt Results
+// PROTECTED ROUTES
 app.post('/api/attempts', verifyToken, async (req, res) => {
   try {
-    // Extract the new 'details' array from the request
     const { quizId, score, accuracyPercent, averageTimeSeconds, details } = req.body;
-    
-    const newAttempt = new Attempt({
-      userId: req.user._id,
-      quizId,
-      score,
-      accuracyPercent,
-      averageTimeSeconds,
-      details // <-- Save it to MongoDB
-    });
+    const newAttempt = new Attempt({ userId: req.user._id, quizId, score, accuracyPercent, averageTimeSeconds, details });
     await newAttempt.save();
-    
     res.status(201).json({ message: 'Result saved successfully!' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to save attempt.' });
   }
 });
 
-// PROTECTED ROUTE: Get all saved quizzes for the user
 app.get('/api/quizzes', verifyToken, async (req, res) => {
   try {
-    const quizzes = await Quiz.find({ userId: req.user._id })
-                              .select('-questions') 
-                              .sort({ createdAt: -1 });
+    const quizzes = await Quiz.find({ userId: req.user._id }).select('-questions').sort({ createdAt: -1 });
     res.json(quizzes);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch quizzes.' });
   }
 });
 
-// PROTECTED ROUTE: Get a specific quiz with all its questions (for retaking)
 app.get('/api/quizzes/:id', verifyToken, async (req, res) => {
   try {
     const quiz = await Quiz.findOne({ _id: req.params.id, userId: req.user._id });
@@ -152,12 +134,9 @@ app.get('/api/quizzes/:id', verifyToken, async (req, res) => {
   }
 });
 
-// PROTECTED ROUTE: Get user's attempt history
 app.get('/api/attempts', verifyToken, async (req, res) => {
   try {
-    const attempts = await Attempt.find({ userId: req.user._id })
-                                  .populate('quizId', 'title')
-                                  .sort({ completedAt: -1 });
+    const attempts = await Attempt.find({ userId: req.user._id }).populate('quizId', 'title').sort({ completedAt: -1 });
     res.json(attempts);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch attempts.' });
