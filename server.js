@@ -1,7 +1,7 @@
 import express from 'express';
 import multer from 'multer';
 import pdfParse from 'pdf-parse';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import Groq from 'groq-sdk'; // <-- Replaced Google with Groq
 import cors from 'cors';
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
@@ -15,8 +15,6 @@ import verifyToken from './middleware/verifyToken.js';
 dotenv.config();
 
 const app = express();
-
-// Enable CORS for all origins (Required for Vercel frontend to talk to Render backend)
 app.use(cors());
 app.use(express.json());
 
@@ -25,9 +23,7 @@ mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB Database'))
   .catch((err) => console.error('❌ MongoDB connection error:', err));
 
-// ==========================================
-// HEALTH CHECK ROUTE (CRITICAL FOR RENDER)
-// ==========================================
+// HEALTH CHECK ROUTE
 app.get('/', (req, res) => {
   res.status(200).send('QuizEngine API is up and running smoothly! 🚀');
 });
@@ -36,7 +32,12 @@ app.get('/', (req, res) => {
 app.use('/api/auth', authRoutes);
 
 const upload = multer({ storage: multer.memoryStorage() });
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Initialize Groq Client
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+// Helper function to prevent rate limits
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // PROTECTED ROUTE: Upload PDF and Generate Quiz
 app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
@@ -46,30 +47,19 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
     const pdfData = await pdfParse(req.file.buffer);
     const fullText = pdfData.text;
 
-    // 1. LOGICAL SPLIT: Split text into an array of questions using Regex
-    // This splits by any line that starts with a number followed by a dot (e.g., "1.", "10.")
+    // 1. LOGICAL SPLIT
     const questionMatches = fullText.split(/(?=\n\s*\d+\.\s)/);
-
-    // Filter out empty strings or noise pages (like headers/footers)
     const questions = questionMatches.filter(q => q.trim().length > 50);
 
-    // 2. BATCHING: Break questions into smaller groups
+    // 2. BATCHING: Group into batches of 20
     const BATCH_SIZE = 20;
     const batches = [];
-
     for (let i = 0; i < questions.length; i += BATCH_SIZE) {
       batches.push(questions.slice(i, i + BATCH_SIZE).join('\n'));
     }
 
-    // 3. PARALLEL PROCESSING
+    // 3. PROCESSING FUNCTION (Powered by Groq)
     const processBatch = async (batchText) => {
-      const model = genAI.getGenerativeModel({
-        model: "gemini-2.5-flash",
-        generationConfig: {
-          responseMimeType: "application/json"
-        }
-      });
-
       const prompt = `
         You are an expert exam processor. Extract multiple-choice questions, options, and correct answers from the following banking exam study text.
         
@@ -98,153 +88,88 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
         Unstructured text data:
         ${batchText}
       `;
-
-      const result = await model.generateContent(prompt);
-      let responseText = result.response.text();
-
-      console.log("\n=== AI RAW OUTPUT START ===");
-      console.log(responseText);
-      console.log("=== AI RAW OUTPUT END ===\n");
-
-      // Strip markdown code blocks
-      responseText = responseText
-        .replace(/```json/gi, '')
-        .replace(/```/gi, '')
-        .trim();
-
-      // Escape stray backslashes
-      responseText = responseText.replace(
-        /\\(?!["\\/bfnrtu])/g,
-        "\\\\"
-      );
-
-      // Remove control characters
+      
+      // Call Groq API with Llama 3.3 70B
+      const chatCompletion = await groq.chat.completions.create({
+        messages: [{ role: "user", content: prompt }],
+        model: "llama-3.3-70b-versatile",
+        temperature: 0.1, // Low temperature for strict JSON accuracy
+      });
+      
+      let responseText = chatCompletion.choices[0]?.message?.content || "[]";
+      
+      // Cleanup Output
+      responseText = responseText.replace(/```json/gi, '').replace(/```/gi, '').trim();
+      responseText = responseText.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
       responseText = responseText.replace(/[\u0000-\u001F]+/g, "");
-
+      
       return JSON.parse(responseText);
     };
 
-    // Process all batches
-    const batchResults = await Promise.all(
-      batches.map(batch => processBatch(batch))
-    );
+    // 4. EXECUTE BATCHES SEQUENTIALLY
+    const finalQuestions = [];
+    for (const batch of batches) {
+      const batchResult = await processBatch(batch);
+      finalQuestions.push(...batchResult);
+      // Wait 12 seconds between batches to avoid token rate limits
+      await delay(12000); 
+    }
 
-    // Flatten all questions
-    const questionsArray = batchResults.flat();
-
-    // Save Quiz
+    // Save the new Quiz to MongoDB
     const newQuiz = new Quiz({
       title: req.file.originalname,
       userId: req.user._id,
-      questions: questionsArray
+      questions: finalQuestions
     });
-
     await newQuiz.save();
 
-    res.json({
-      quizId: newQuiz._id,
-      title: newQuiz.title,
-      questions: questionsArray
-    });
+    res.json({ quizId: newQuiz._id, title: newQuiz.title, questions: finalQuestions });
 
   } catch (error) {
     console.error('Processing Error:', error);
-    res.status(500).json({
-      error: error.message || 'Server failed to process document.'
-    });
+    res.status(500).json({ error: error.message || 'Server failed to process document.' });
   }
 });
 
-// PROTECTED ROUTE: Save Quiz Attempt Results
+// PROTECTED ROUTES
 app.post('/api/attempts', verifyToken, async (req, res) => {
   try {
-    const {
-      quizId,
-      score,
-      accuracyPercent,
-      averageTimeSeconds,
-      details
-    } = req.body;
-
-    const newAttempt = new Attempt({
-      userId: req.user._id,
-      quizId,
-      score,
-      accuracyPercent,
-      averageTimeSeconds,
-      details
-    });
-
+    const { quizId, score, accuracyPercent, averageTimeSeconds, details } = req.body;
+    const newAttempt = new Attempt({ userId: req.user._id, quizId, score, accuracyPercent, averageTimeSeconds, details });
     await newAttempt.save();
-
-    res.status(201).json({
-      message: 'Result saved successfully!'
-    });
+    res.status(201).json({ message: 'Result saved successfully!' });
   } catch (error) {
-    res.status(500).json({
-      error: 'Failed to save attempt.'
-    });
+    res.status(500).json({ error: 'Failed to save attempt.' });
   }
 });
 
-// PROTECTED ROUTE: Get all saved quizzes for the user
 app.get('/api/quizzes', verifyToken, async (req, res) => {
   try {
-    const quizzes = await Quiz.find({
-      userId: req.user._id
-    })
-      .select('-questions')
-      .sort({ createdAt: -1 });
-
+    const quizzes = await Quiz.find({ userId: req.user._id }).select('-questions').sort({ createdAt: -1 });
     res.json(quizzes);
   } catch (error) {
-    res.status(500).json({
-      error: 'Failed to fetch quizzes.'
-    });
+    res.status(500).json({ error: 'Failed to fetch quizzes.' });
   }
 });
 
-// PROTECTED ROUTE: Get a specific quiz with all its questions
 app.get('/api/quizzes/:id', verifyToken, async (req, res) => {
   try {
-    const quiz = await Quiz.findOne({
-      _id: req.params.id,
-      userId: req.user._id
-    });
-
-    if (!quiz) {
-      return res.status(404).json({
-        error: 'Quiz not found.'
-      });
-    }
-
+    const quiz = await Quiz.findOne({ _id: req.params.id, userId: req.user._id });
+    if (!quiz) return res.status(404).json({ error: 'Quiz not found.' });
     res.json(quiz);
   } catch (error) {
-    res.status(500).json({
-      error: 'Failed to load quiz.'
-    });
+    res.status(500).json({ error: 'Failed to load quiz.' });
   }
 });
 
-// PROTECTED ROUTE: Get user's attempt history
 app.get('/api/attempts', verifyToken, async (req, res) => {
   try {
-    const attempts = await Attempt.find({
-      userId: req.user._id
-    })
-      .populate('quizId', 'title')
-      .sort({ completedAt: -1 });
-
+    const attempts = await Attempt.find({ userId: req.user._id }).populate('quizId', 'title').sort({ completedAt: -1 });
     res.json(attempts);
   } catch (error) {
-    res.status(500).json({
-      error: 'Failed to fetch attempts.'
-    });
+    res.status(500).json({ error: 'Failed to fetch attempts.' });
   }
 });
 
 const PORT = process.env.PORT || 5000;
-
-app.listen(PORT, () => {
-  console.log(`Server executing smoothly on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server executing smoothly on port ${PORT}`));
