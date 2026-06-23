@@ -34,6 +34,9 @@ app.use('/api/auth', authRoutes);
 const upload = multer({ storage: multer.memoryStorage() });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+// Helper function to throttle requests (12 seconds delay = 5 req/min)
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 // PROTECTED ROUTE: Upload PDF and Generate Quiz
 app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
   try {
@@ -42,7 +45,7 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
     const pdfData = await pdfParse(req.file.buffer);
     const fullText = pdfData.text;
 
-    // 1. LOGICAL SPLIT: Split by pattern (e.g., "1. ", "2. ")
+    // 1. LOGICAL SPLIT
     const questionMatches = fullText.split(/(?=\n\s*\d+\.\s)/);
     const questions = questionMatches.filter(q => q.trim().length > 50);
 
@@ -53,7 +56,7 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
       batches.push(questions.slice(i, i + BATCH_SIZE).join('\n'));
     }
 
-    // 3. PARALLEL PROCESSING FUNCTION
+    // 3. PARALLEL PROCESSING FUNCTION (Renamed internally for clarity)
     const processBatch = async (batchText) => {
       const model = genAI.getGenerativeModel({ 
         model: "gemini-2.5-flash", 
@@ -75,7 +78,6 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
       const result = await model.generateContent(prompt);
       let responseText = result.response.text();
       
-      // Cleanup AI Output
       responseText = responseText.replace(/```json/gi, '').replace(/```/gi, '').trim();
       responseText = responseText.replace(/\\(?!["\\/bfnrtu])/g, "\\\\");
       responseText = responseText.replace(/[\u0000-\u001F]+/g, "");
@@ -83,9 +85,19 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
       return JSON.parse(responseText);
     };
 
-    // Process all batches concurrently
-    const results = await Promise.all(batches.map(batch => processBatch(batch)));
-    const finalQuestions = results.flat(); // Merge all batch arrays into one
+    // 4. SEQUENTIAL PROCESSING (Throttled to avoid 429 Errors)
+    const finalQuestions = [];
+    for (const batch of batches) {
+      try {
+        const batchResult = await processBatch(batch);
+        finalQuestions.push(...batchResult);
+        
+        // Wait 12 seconds to ensure we stay under the 5 requests/minute limit
+        await delay(12000); 
+      } catch (err) {
+        console.error("Batch processing failed, skipping this batch:", err);
+      }
+    }
 
     // Save the new Quiz to MongoDB
     const newQuiz = new Quiz({
@@ -103,7 +115,7 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
   }
 });
 
-// PROTECTED ROUTES
+// PROTECTED ROUTES (Unchanged)
 app.post('/api/attempts', verifyToken, async (req, res) => {
   try {
     const { quizId, score, accuracyPercent, averageTimeSeconds, details } = req.body;
