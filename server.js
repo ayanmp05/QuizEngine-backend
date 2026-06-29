@@ -73,14 +73,16 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
     // 3. PROCESSING FUNCTION (Powered by Groq)
     const processBatch = async (batchText) => {
       const prompt = `
-        You are an expert exam processor. Extract multiple-choice questions, options, and correct answers from the following banking exam study text.
+        You are an expert exam processor. Extract multiple-choice questions, options, and correct answers from the following study text.
         
         CRITICAL INSTRUCTIONS:
-        1. ENGLISH LANGUAGE ONLY: The provided text may contain both English and Hindi translations of the same questions. You MUST strictly IGNORE all Hindi text. ONLY extract the English versions of the questions, directions, and options. Do not include any Hindi characters in your output.
-        2. CAPTURE DIRECTION BLOCKS: Look for instruction blocks that apply to multiple questions (e.g., "Directions: The questions are based upon the following series..."). You MUST prepend this exact instruction/series string to the front of the "question" field for EVERY single question it applies to.
-        3. EXTRACT OPTIONS: You MUST locate and extract the multiple-choice options (usually labeled A, B, C, D, E) from the text immediately following the question. Do NOT just read the answer key at the end of the document. The "options" array MUST contain at least 4 strings. NEVER leave the options array empty.
-        4. IGNORE promotional header/footer noise, website URLs ("smartkeeda.com"), and page numbers.
-        5. IGNORE detailed answer explanation text blocks at the end of the document.
+        1. DYNAMIC LANGUAGE HANDLING: 
+           - If the text contains the SAME question translated into multiple languages (e.g., English and Hindi side-by-side), you MUST prioritize and extract ONLY the English version. 
+           - If the text is provided entirely in a regional language (e.g., Bengali) without English translations, extract the questions, options, and answers exactly in that native regional language.
+        2. CAPTURE DIRECTION BLOCKS: Look for instruction blocks that apply to multiple questions (e.g., "Directions: The questions are based upon..."). You MUST prepend this exact instruction/series string to the front of the "question" field for EVERY single question it applies to.
+        3. EXTRACT OPTIONS: Locate and extract the multiple-choice options (which may be labeled A, B, C, D, E OR 1, 2, 3, 4) from the text immediately following the question. The "options" array MUST contain at least 4 strings. NEVER leave the options array empty.
+        4. ANSWER EXTRACTION: Extract the correct answer string. Note that the answer may be located at the very end of the document, OR directly underneath the question options (e.g., "Answer: Option 3: 15 km").
+        5. IGNORE NOISE: Strictly ignore promotional headers/footers, website URLs ("smartkeeda.com", "testbook.com"), page numbers, phrases like "View this Question Online", "Detailed Solution Below", and detailed step-by-step mathematical explanations.
         6. Output a strict JSON array of objects following this exact schema:
 
         [
@@ -88,10 +90,10 @@ app.post('/api/upload', verifyToken, upload.single('pdf'), async (req, res) => {
             "id": 1,
             "question": "The combined directions/series text AND the specific question text string",
             "options": [
-              "Option A text",
-              "Option B text",
-              "Option C text",
-              "Option D text"
+              "Option 1/A text",
+              "Option 2/B text",
+              "Option 3/C text",
+              "Option 4/D text"
             ],
             "answer": "The exact correct option string matching one of the items in the options array"
           }
